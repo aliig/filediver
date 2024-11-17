@@ -23,7 +23,6 @@ import (
 	"github.com/xypwn/filediver/stingray"
 )
 
-// extractionWorker handles file extraction in a separate goroutine
 func extractionWorker(
 	ctx context.Context,
 	jobs <-chan extractionJob,
@@ -33,21 +32,37 @@ func extractionWorker(
 	extrCfg map[string]map[string]string,
 	runner *exec.Runner,
 ) {
-	for job := range jobs {
-		success := false
-		var err error
-		_, err = a.ExtractFile(ctx, job.fileID, outDir, extrCfg, runner)
-		if err == nil {
-			success = true
-		} else if !errors.Is(err, context.Canceled) {
-			err = fmt.Errorf("failed to extract %v: %w", job.fileName, err)
-		}
+	for {
+		select {
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			success := false
+			var err error
 
-		results <- extractionResult{
-			index:    job.index,
-			fileName: job.fileName,
-			success:  success,
-			err:      err,
+			extractCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			_, err = a.ExtractFile(extractCtx, job.fileID, outDir, extrCfg, runner)
+			cancel()
+
+			if err == nil {
+				success = true
+			} else if !errors.Is(err, context.Canceled) {
+				err = fmt.Errorf("failed to extract %v: %w", job.fileName, err)
+			}
+
+			select {
+			case results <- extractionResult{
+				index:    job.index,
+				fileName: job.fileName,
+				success:  success,
+				err:      err,
+			}:
+			case <-ctx.Done():
+				return
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -69,17 +84,61 @@ type extractionProgress struct {
 	completed atomic.Int32
 	total     int32
 	lastFile  atomic.Pointer[string]
+	errors    []error
+	mu        sync.Mutex
 }
 
 func newExtractionProgress(total int) *extractionProgress {
 	return &extractionProgress{
-		total: int32(total),
+		total:  int32(total),
+		errors: make([]error, 0),
 	}
 }
 
 func (p *extractionProgress) increment(fileName string) {
 	p.completed.Add(1)
 	p.lastFile.Store(&fileName)
+}
+
+func (p *extractionProgress) addError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errors = append(p.errors, err)
+}
+
+func (p *extractionProgress) getErrors() []error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]error{}, p.errors...)
+}
+
+func reportProgress(ctx context.Context, progress *extractionProgress, prt *app.Printer) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			completed := progress.completed.Load()
+			if completed >= progress.total {
+				return
+			}
+			lastFile := progress.lastFile.Load()
+			if lastFile != nil {
+				truncName := *lastFile
+				if len(truncName) > 40 {
+					truncName = "..." + truncName[len(truncName)-37:]
+				}
+				prt.Statusf("Progress: %.1f%% (%d/%d) | Current: %s",
+					float64(completed)/float64(progress.total)*100,
+					completed,
+					progress.total,
+					truncName)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func main() {
@@ -110,9 +169,6 @@ extractor config:
 
 performance options:
   -p, --parallel N    number of parallel extraction workers (default: 1)
-  examples:
-    filediver -c "enable:video" -p 4         extract all video files using 4 parallel workers
-    filediver -c "enable:all" -p 8           extract everything using 8 parallel workers
 ` + app.ExtractorConfigHelpMessage(app.ConfigFormat),
 		DisableDefaultShowHelp: true,
 	})
@@ -281,66 +337,31 @@ performance options:
 			prt.Infof("Extracting files...")
 		}
 
+		progress := newExtractionProgress(len(sortedFileIDs))
+		progressDone := make(chan struct{})
+
+		go func() {
+			defer close(progressDone)
+			reportProgress(ctx, progress, prt)
+		}()
+
 		if *numWorkers <= 1 {
-			// Original sequential extraction logic
-			numExtrFiles := 0
-			for i, id := range sortedFileIDs {
-				truncName := getFileName(id)
-				if len(truncName) > 40 {
-					truncName = "..." + truncName[len(truncName)-37:]
-				}
-				prt.Statusf("File %v/%v: %v", i+1, len(files), truncName)
+			for _, id := range sortedFileIDs {
+				fileName := getFileName(id)
 				if _, err := a.ExtractFile(ctx, id, *outDir, extrCfg, runners[0]); err == nil {
-					numExtrFiles++
+					progress.increment(fileName)
 				} else {
 					if errors.Is(err, context.Canceled) {
-						prt.NoStatus()
-						prt.Warnf("Extraction canceled, exiting cleanly")
-						return
+						cancel()
+						break
 					} else {
-						prt.Errorf("%v", err)
+						progress.addError(fmt.Errorf("failed to extract %v: %w", fileName, err))
 					}
 				}
 			}
-			prt.NoStatus()
-			prt.Infof("Extracted %v/%v matching files", numExtrFiles, len(files))
 		} else {
-			// Parallel extraction logic
 			jobs := make(chan extractionJob, *numWorkers)
-			results := make(chan extractionResult, *numWorkers)
-			progress := newExtractionProgress(len(sortedFileIDs))
-
-			// Start progress reporter
-			progressDone := make(chan struct{})
-			go func() {
-				defer close(progressDone)
-				ticker := time.NewTicker(100 * time.Millisecond)
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-ticker.C:
-						completed := progress.completed.Load()
-						if completed >= progress.total {
-							return
-						}
-						lastFile := progress.lastFile.Load()
-						if lastFile != nil {
-							truncName := *lastFile
-							if len(truncName) > 40 {
-								truncName = "..." + truncName[len(truncName)-37:]
-							}
-							prt.Statusf("Progress: %.1f%% (%d/%d) | Current: %s",
-								float64(completed)/float64(progress.total)*100,
-								completed,
-								progress.total,
-								truncName)
-						}
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
+			results := make(chan extractionResult, len(sortedFileIDs))
 
 			// Start worker pool
 			var wg sync.WaitGroup
@@ -352,55 +373,58 @@ performance options:
 				}(i)
 			}
 
-			// Start result collector
-			numExtrFiles := 0
-			errList := make([]error, 0)
-			done := make(chan struct{})
-
 			go func() {
-				for i := 0; i < len(sortedFileIDs); i++ {
-					result := <-results
+				for i, id := range sortedFileIDs {
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- extractionJob{
+						index:    i,
+						fileID:   id,
+						fileName: getFileName(id),
+					}:
+					}
+				}
+				close(jobs)
+			}()
 
+			resultTimeout := time.NewTimer(30 * time.Second)
+			defer resultTimeout.Stop()
+
+			for i := 0; i < len(sortedFileIDs); i++ {
+				select {
+				case result := <-results:
+					resultTimeout.Reset(30 * time.Second)
 					if result.success {
-						numExtrFiles++
 						progress.increment(result.fileName)
 					} else if result.err != nil {
 						if errors.Is(result.err, context.Canceled) {
 							cancel()
 						} else {
-							errList = append(errList, result.err)
+							progress.addError(result.err)
 						}
 					}
-				}
-				close(done)
-			}()
-
-			// Send jobs
-			for i, id := range sortedFileIDs {
-				select {
+				case <-resultTimeout.C:
+					progress.addError(fmt.Errorf("extraction timeout reached, canceling remaining operations"))
+					cancel()
+					goto cleanup
 				case <-ctx.Done():
 					goto cleanup
-				default:
-					jobs <- extractionJob{
-						index:    i,
-						fileID:   id,
-						fileName: getFileName(id),
-					}
 				}
 			}
 
 		cleanup:
-			close(jobs)
 			wg.Wait()
-			close(results)
-			<-done
-			<-progressDone
-
-			prt.NoStatus()
-			for _, err := range errList {
-				prt.Errorf("%v", err)
-			}
-			prt.Infof("Extracted %v/%v matching files", numExtrFiles, len(files))
 		}
+
+		<-progressDone
+		prt.NoStatus()
+
+		for _, err := range progress.getErrors() {
+			prt.Errorf("%v", err)
+		}
+
+		completed := progress.completed.Load()
+		prt.Infof("Extracted %v/%v matching files", completed, len(files))
 	}
 }
