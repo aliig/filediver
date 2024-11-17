@@ -183,7 +183,7 @@ performance options:
 	knownHashesPath := parser.String("", "hashes_file", &argparse.Option{Help: "Path to a text file containing known file and type names"})
 	numWorkers := parser.Int("p", "parallel", &argparse.Option{
 		Default: "1",
-		Help:    fmt.Sprintf("Number of parallel extraction workers (default: 1)"),
+		Help:    "Number of parallel extraction workers (default: 1)",
 	})
 
 	if err := parser.Parse(nil); err != nil {
