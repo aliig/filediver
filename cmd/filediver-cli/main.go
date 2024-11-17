@@ -10,7 +10,9 @@ import (
 	"runtime/pprof"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/hellflame/argparse"
 	"github.com/jwalton/go-supportscolor"
@@ -61,6 +63,23 @@ type extractionResult struct {
 	fileName string
 	success  bool
 	err      error
+}
+
+type extractionProgress struct {
+	completed atomic.Int32
+	total     int32
+	lastFile  atomic.Pointer[string]
+}
+
+func newExtractionProgress(total int) *extractionProgress {
+	return &extractionProgress{
+		total: int32(total),
+	}
+}
+
+func (p *extractionProgress) increment(fileName string) {
+	p.completed.Add(1)
+	p.lastFile.Store(&fileName)
 }
 
 func main() {
@@ -292,6 +311,39 @@ performance options:
 			// Parallel extraction logic
 			jobs := make(chan extractionJob, *numWorkers)
 			results := make(chan extractionResult, *numWorkers)
+			progress := newExtractionProgress(len(sortedFileIDs))
+
+			// Start progress reporter
+			progressDone := make(chan struct{})
+			go func() {
+				defer close(progressDone)
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ticker.C:
+						completed := progress.completed.Load()
+						if completed >= progress.total {
+							return
+						}
+						lastFile := progress.lastFile.Load()
+						if lastFile != nil {
+							truncName := *lastFile
+							if len(truncName) > 40 {
+								truncName = "..." + truncName[len(truncName)-37:]
+							}
+							prt.Statusf("Progress: %.1f%% (%d/%d) | Current: %s",
+								float64(completed)/float64(progress.total)*100,
+								completed,
+								progress.total,
+								truncName)
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
 
 			// Start worker pool
 			var wg sync.WaitGroup
@@ -311,14 +363,10 @@ performance options:
 			go func() {
 				for i := 0; i < len(sortedFileIDs); i++ {
 					result := <-results
-					truncName := result.fileName
-					if len(truncName) > 40 {
-						truncName = "..." + truncName[len(truncName)-37:]
-					}
-					prt.Statusf("File %v/%v: %v", result.index+1, len(files), truncName)
 
 					if result.success {
 						numExtrFiles++
+						progress.increment(result.fileName)
 					} else if result.err != nil {
 						if errors.Is(result.err, context.Canceled) {
 							cancel()
@@ -349,6 +397,7 @@ performance options:
 			wg.Wait()
 			close(results)
 			<-done
+			<-progressDone
 
 			prt.NoStatus()
 			for _, err := range errList {
