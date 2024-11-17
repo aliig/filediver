@@ -117,7 +117,6 @@ performance options:
 		DisableDefaultShowHelp: true,
 	})
 
-	// Existing flags
 	gameDir := parser.String("g", "gamedir", &argparse.Option{Help: "Helldivers 2 game directory"})
 	modeList := parser.Flag("l", "list", &argparse.Option{Help: "List all files without extracting anything"})
 	outDir := parser.String("o", "out", &argparse.Option{Default: "extracted", Help: "Output directory (default: extracted)"})
@@ -126,8 +125,6 @@ performance options:
 	extrExclGlob := parser.String("x", "exclude", &argparse.Option{Help: "Exclude matching files from selection (glob syntax, can be mixed with --include, see matching files section)"})
 	cpuProfile := parser.String("", "cpuprofile", &argparse.Option{Help: "Write CPU diagnostic profile to specified file"})
 	knownHashesPath := parser.String("", "hashes_file", &argparse.Option{Help: "Path to a text file containing known file and type names"})
-
-	// New parallel processing flag
 	numWorkers := parser.Int("p", "parallel", &argparse.Option{
 		Default: "1",
 		Help:    fmt.Sprintf("Number of parallel extraction workers (default: 1)"),
@@ -161,7 +158,7 @@ performance options:
 	for i := 0; i < *numWorkers; i++ {
 		runner := exec.NewRunner()
 		if ok := runner.Add("ffmpeg", "-y", "-hide_banner", "-loglevel", "error"); !ok && i == 0 {
-			prt.Warnf("FFmpeg not installed or found locally. Please install FFmpeg, or place ffmpeg.exe in the current folder to convert videos to MP4 and audio to a variety of formats. Without FFmpeg, videos will be saved as BIK and audio will be saved was WAV.")
+			prt.Warnf("FFmpeg not installed or found locally. Please install FFmpeg, or place ffmpeg.exe in the current folder to convert videos to MP4 and audio to a variety of formats. Without FFmpeg, videos will be saved as BIK and audio will be saved as WAV.")
 		}
 		runners = append(runners, runner)
 	}
