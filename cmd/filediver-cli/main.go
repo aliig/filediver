@@ -9,9 +9,8 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"sort"
+	"sync"
 	"syscall"
-
-	//"github.com/davecgh/go-spew/spew"
 
 	"github.com/hellflame/argparse"
 	"github.com/jwalton/go-supportscolor"
@@ -21,6 +20,48 @@ import (
 	"github.com/xypwn/filediver/hashes"
 	"github.com/xypwn/filediver/stingray"
 )
+
+// extractionWorker handles file extraction in a separate goroutine
+func extractionWorker(
+	ctx context.Context,
+	jobs <-chan extractionJob,
+	results chan<- extractionResult,
+	a *app.App,
+	outDir string,
+	extrCfg map[string]map[string]string,
+	runner *exec.Runner,
+) {
+	for job := range jobs {
+		success := false
+		var err error
+		_, err = a.ExtractFile(ctx, job.fileID, outDir, extrCfg, runner)
+		if err == nil {
+			success = true
+		} else if !errors.Is(err, context.Canceled) {
+			err = fmt.Errorf("failed to extract %v: %w", job.fileName, err)
+		}
+
+		results <- extractionResult{
+			index:    job.index,
+			fileName: job.fileName,
+			success:  success,
+			err:      err,
+		}
+	}
+}
+
+type extractionJob struct {
+	index    int
+	fileID   stingray.FileID
+	fileName string
+}
+
+type extractionResult struct {
+	index    int
+	fileName string
+	success  bool
+	err      error
+}
 
 func main() {
 	prt := app.NewPrinter(
@@ -47,9 +88,17 @@ extractor config:
     filediver -c "enable:audio"              only extract audio
     filediver -c "enable:bik bik:format=bik" only extract bik files, but don't convert them to mp4
     filediver -c "audio:format=ogg"          convert audio to ogg instead of wav
+
+performance options:
+  -p, --parallel N    number of parallel extraction workers (default: 1)
+  examples:
+    filediver -c "enable:video" -p 4         extract all video files using 4 parallel workers
+    filediver -c "enable:all" -p 8           extract everything using 8 parallel workers
 ` + app.ExtractorConfigHelpMessage(app.ConfigFormat),
 		DisableDefaultShowHelp: true,
 	})
+
+	// Existing flags
 	gameDir := parser.String("g", "gamedir", &argparse.Option{Help: "Helldivers 2 game directory"})
 	modeList := parser.Flag("l", "list", &argparse.Option{Help: "List all files without extracting anything"})
 	outDir := parser.String("o", "out", &argparse.Option{Default: "extracted", Help: "Output directory (default: extracted)"})
@@ -57,8 +106,14 @@ extractor config:
 	extrInclGlob := parser.String("i", "include", &argparse.Option{Help: "Select only matching files (glob syntax, see matching files section)"})
 	extrExclGlob := parser.String("x", "exclude", &argparse.Option{Help: "Exclude matching files from selection (glob syntax, can be mixed with --include, see matching files section)"})
 	cpuProfile := parser.String("", "cpuprofile", &argparse.Option{Help: "Write CPU diagnostic profile to specified file"})
-	//verbose := parser.Flag("v", "verbose", &argparse.Option{Help: "Provide more detailed status output"})
 	knownHashesPath := parser.String("", "hashes_file", &argparse.Option{Help: "Path to a text file containing known file and type names"})
+
+	// New parallel processing flag
+	numWorkers := parser.Int("p", "parallel", &argparse.Option{
+		Default: "1",
+		Help:    fmt.Sprintf("Number of parallel extraction workers (default: 1)"),
+	})
+
 	if err := parser.Parse(nil); err != nil {
 		if err == argparse.BreakAfterHelpError {
 			os.Exit(0)
@@ -82,11 +137,20 @@ extractor config:
 		prt.Fatalf("%v", err)
 	}
 
-	runner := exec.NewRunner()
-	if ok := runner.Add("ffmpeg", "-y", "-hide_banner", "-loglevel", "error"); !ok {
-		prt.Warnf("FFmpeg not installed or found locally. Please install FFmpeg, or place ffmpeg.exe in the current folder to convert videos to MP4 and audio to a variety of formats. Without FFmpeg, videos will be saved as BIK and audio will be saved was WAV.")
+	// Create a Runner per worker to avoid contention
+	var runners []*exec.Runner
+	for i := 0; i < *numWorkers; i++ {
+		runner := exec.NewRunner()
+		if ok := runner.Add("ffmpeg", "-y", "-hide_banner", "-loglevel", "error"); !ok && i == 0 {
+			prt.Warnf("FFmpeg not installed or found locally. Please install FFmpeg, or place ffmpeg.exe in the current folder to convert videos to MP4 and audio to a variety of formats. Without FFmpeg, videos will be saved as BIK and audio will be saved was WAV.")
+		}
+		runners = append(runners, runner)
 	}
-	defer runner.Close()
+	defer func() {
+		for _, r := range runners {
+			r.Close()
+		}
+	}()
 
 	if *gameDir == "" {
 		var err error
@@ -116,6 +180,7 @@ extractor config:
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -194,29 +259,102 @@ extractor config:
 			fmt.Println(getFileName(id))
 		}
 	} else {
-		prt.Infof("Extracting files...")
-
-		numExtrFiles := 0
-		for i, id := range sortedFileIDs {
-			truncName := getFileName(id)
-			if len(truncName) > 40 {
-				truncName = "..." + truncName[len(truncName)-37:]
-			}
-			prt.Statusf("File %v/%v: %v", i+1, len(files), truncName)
-			if _, err := a.ExtractFile(ctx, id, *outDir, extrCfg, runner); err == nil {
-				numExtrFiles++
-			} else {
-				if errors.Is(err, context.Canceled) {
-					prt.NoStatus()
-					prt.Warnf("Extraction canceled, exiting cleanly")
-					return
-				} else {
-					prt.Errorf("%v", err)
-				}
-			}
+		if *numWorkers > 1 {
+			prt.Infof("Extracting files using %d workers...", *numWorkers)
+		} else {
+			prt.Infof("Extracting files...")
 		}
 
-		prt.NoStatus()
-		prt.Infof("Extracted %v/%v matching files", numExtrFiles, len(files))
+		if *numWorkers <= 1 {
+			// Original sequential extraction logic
+			numExtrFiles := 0
+			for i, id := range sortedFileIDs {
+				truncName := getFileName(id)
+				if len(truncName) > 40 {
+					truncName = "..." + truncName[len(truncName)-37:]
+				}
+				prt.Statusf("File %v/%v: %v", i+1, len(files), truncName)
+				if _, err := a.ExtractFile(ctx, id, *outDir, extrCfg, runners[0]); err == nil {
+					numExtrFiles++
+				} else {
+					if errors.Is(err, context.Canceled) {
+						prt.NoStatus()
+						prt.Warnf("Extraction canceled, exiting cleanly")
+						return
+					} else {
+						prt.Errorf("%v", err)
+					}
+				}
+			}
+			prt.NoStatus()
+			prt.Infof("Extracted %v/%v matching files", numExtrFiles, len(files))
+		} else {
+			// Parallel extraction logic
+			jobs := make(chan extractionJob, *numWorkers)
+			results := make(chan extractionResult, *numWorkers)
+
+			// Start worker pool
+			var wg sync.WaitGroup
+			for i := 0; i < *numWorkers; i++ {
+				wg.Add(1)
+				go func(workerID int) {
+					defer wg.Done()
+					extractionWorker(ctx, jobs, results, a, *outDir, extrCfg, runners[workerID])
+				}(i)
+			}
+
+			// Start result collector
+			numExtrFiles := 0
+			errList := make([]error, 0)
+			done := make(chan struct{})
+
+			go func() {
+				for i := 0; i < len(sortedFileIDs); i++ {
+					result := <-results
+					truncName := result.fileName
+					if len(truncName) > 40 {
+						truncName = "..." + truncName[len(truncName)-37:]
+					}
+					prt.Statusf("File %v/%v: %v", result.index+1, len(files), truncName)
+
+					if result.success {
+						numExtrFiles++
+					} else if result.err != nil {
+						if errors.Is(result.err, context.Canceled) {
+							cancel()
+						} else {
+							errList = append(errList, result.err)
+						}
+					}
+				}
+				close(done)
+			}()
+
+			// Send jobs
+			for i, id := range sortedFileIDs {
+				select {
+				case <-ctx.Done():
+					goto cleanup
+				default:
+					jobs <- extractionJob{
+						index:    i,
+						fileID:   id,
+						fileName: getFileName(id),
+					}
+				}
+			}
+
+		cleanup:
+			close(jobs)
+			wg.Wait()
+			close(results)
+			<-done
+
+			prt.NoStatus()
+			for _, err := range errList {
+				prt.Errorf("%v", err)
+			}
+			prt.Infof("Extracted %v/%v matching files", numExtrFiles, len(files))
+		}
 	}
 }

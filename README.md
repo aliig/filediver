@@ -56,6 +56,11 @@ Extract only video files:
 ./filediver -c "enable:video"
 ```
 
+Extract only audio files using 4 parallel workers for faster processing:
+```sh
+./filediver -c "enable:video" -p 4
+```
+
 Extract the Super Earth anthem as mp3:
 ```sh
 ./filediver -c "audio:format=mp3" -i "content/audio/291227525.wwise_stream"
